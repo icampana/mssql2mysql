@@ -1,0 +1,262 @@
+#!/usr/bin/python
+
+import sys, getopt, string, getpass
+import pymssql
+import logging
+import time
+import types
+
+system_tables = [ "syssegments", "sysconstraints", "dtproperties"]
+
+def main(argv):
+	global dataLimit
+	
+	try:
+		opts, args = getopt.getopt(argv, "h:d:t:r:u:pl:vU", ["help","host=","database=","tables=","result=","user=","password=","verbose", "limit"])
+	except getopt.GetoptError:
+		usage()
+		sys.exit(2)
+
+	# Start values for variables
+	dbHost = "localhost"
+	dbName = "master"
+	dbUser = "sa"
+	dbPass = ""
+	dbTables = ""
+	dataLimit = 0
+	
+	for o, a in opts:
+		if o in ("-v", "--verbose"):
+			verbose = True
+		if o == "--help":
+			usage()
+			sys.exit()
+		if o in ("-h", "--host"):
+			dbHost = a
+		if o in ("-d", "--database"):
+			dbName = a
+		if o in ("-u", "--user"):
+			dbUser = a
+		if o in ("-p", "--password"):
+			if len(a) >0:
+				dbPass = a
+			else:
+				dbPass = getpass.getpass(dbUser + "'s Password:")
+
+		if o in ("-t","--tables"):
+			dbTables = string.split(a, ",")
+		if o in ("-l","--limit"):
+			dataLimit = int(a)
+	dbDump(dbHost, dbName, dbUser, dbPass, dbTables)
+
+def usage ():
+	logging.getLogger().error(u"""
+	Python script to dump a MSSQL Server Database to a SQL Script suitable for MySQL
+	Requires the freetds library and the pymssql module
+	
+	mssql2mysql [options] [tables = tablename]
+	
+	OPTIONS:
+	--host=<hostname> .- Specifies the hostname to connect to
+	--db=<dbname>	 .- Database name to use
+	--user=<username>  .- Username with login privilegies
+	--password=<password>.- Password for username
+	--tables=<tables1>,<table2>.- List of tables that you want to dump
+	--limit=n 	.- Specifies the limit (TOP) for the number of data to retrieve
+	""")
+
+def dbDump(dbhost, dbname, dbuser, dbpassw, dbtables):
+	global system_tables
+
+	try:
+		con = pymssql.connect(user = dbuser, password = dbpassw, host = dbhost, database = dbname)
+	except:
+		logging.getLogger().error("Error: Can't connect to database")
+		sys.exit(2)
+		
+# 	dbDump = "### MSSQL 2 MYSQL DUMP ###"
+	
+	cur = con.cursor()
+	
+	if len(dbtables)>0:
+		rows = dbtables
+	else:
+		cur.execute("EXEC sp_tables null,null,null,\"'VIEW','TABLE'\";")
+		rows = [ item[2] for item in cur.fetchall() ]
+
+	for table_name in rows:
+		if table_name not in system_tables:
+			getTableSchema(cur, table_name)
+			getTableData(cur, table_name)
+	
+	cur.close()
+	con.close()
+
+def getTableSchema(cur, tableName):
+	start_time = time.time()
+	logging.getLogger().debug("Getting table schema for table %s",tableName)
+	curColumns = cur
+	query = "EXEC sp_columns " + tableName + ";"
+	curColumns.execute(query)
+	
+	schema = "\n\nDROP TABLE IF EXISTS `" + tableName + "`;\n"
+	schema += "CREATE TABLE `" + tableName + "` (\n"
+	
+	cols_schema = []
+	
+	for columnas in curColumns.fetchall():
+		# 3 -> COLUMN NAME
+		# 5-> DATA TYPE
+		# 6 -> PRECISION
+		# 7-> VAR SIZE
+		# 8 -> SCALE
+		#10 -> IS_NULL
+		if columnas[10] == 1 :
+			nullable =  " NULL" 
+		else:
+			nullable =  " NOT NULL"
+
+		data_type = getDataType(type=columnas[5], size=columnas[7], precision=columnas[6], scale=columnas[8])
+		col_data = "\t`%s` %s %s" %(columnas[3], data_type, nullable)
+		cols_schema.append(col_data)
+	
+	if len(cols_schema)>0:
+		schema += ",\n".join(cols_schema)
+	
+	schema += getIndexes(cur, tableName)
+	schema += "\n);"
+	
+	print schema
+	logging.getLogger().debug("Exported schema for %s in %s seconds",tableName,time.time()-start_time)
+
+def getDataType(type, size=None, precision =0, scale =0):
+	if type in ("varchar", "nvarchar"):
+		if size > 255:
+			return "TEXT"
+		else :
+			return "VARCHAR(%d)" % size
+	elif type in ("text", "ntext"):
+		return "TEXT"
+	elif type in ("char", "nchar"):
+		return "CHAR(%d)" % size
+	elif type in ("int", "int8"):
+		return "INT"
+	elif type in ("datetime", "smalldatetime"):
+		return "DATETIME"
+	elif type in ("image", "binary","varbinary"):
+		return "BLOB"
+	elif type in ("money", "smallmoney", "decimal", "numeric"):
+		return "DECIMAL (%d,%d)" % (precision, scale)
+	elif type in ("float", "real"):
+		return "FLOAT"
+	elif type == "int identity":
+		return "INT AUTO_INCREMENT"
+	else:
+		return type.upper()
+
+def getIndexes(cur, tableName):
+	curInd = cur
+
+	query = "EXEC sp_indexes_rowset " + tableName + ";"
+	#This is used to get all the indexes, by now just get the PRIMARY KEY
+	
+	curInd.execute(query)
+	
+	#Fields for the whole Indexes, not used by now
+	#5 -> INDEX_NAME
+	#6 -> PRIMARY_KEY
+	#7 -> UNIQUE
+	#9 -> TYPE
+	#17 -> COLUMN_NAME
+
+	result = ""
+	
+	pk_index = [columnas[17] for columnas in curInd.fetchall() if columnas[6]=='\x01']
+	if len(pk_index)>0:
+		result = ",\nPRIMARY KEY ("
+		result += ",".join(pk_index)
+		result += ")"
+	
+	#curInd.close()
+	return result
+
+def getTableData(cur, tableName):
+	global dataLimit
+	
+	cursor = cur
+	sql = ""
+	sqlLimit = ""
+	
+	if dataLimit > 0 :
+		sqlLimit = "TOP %s" % dataLimit
+	
+	start_time = time.time()
+	sqlsql = "SELECT " + sqlLimit + " * FROM " + tableName
+	logging.getLogger().debug("Executing %s",sqlsql)
+	cursor.execute(sqlsql)
+	logging.getLogger().debug("Executed SQL in %s seconds",time.time()-start_time)
+	
+	logging.getLogger().debug("Dumping register(s) for table %s\n" % (tableName))
+# 	print "\n\n#Dumping %d register(s) for table %s\n" % (cursor.rowcount, tableName)
+	while True:
+		start_time = time.time()
+		logging.getLogger().debug("Getting 20000 records")
+		items = cursor.fetchmany(20000)
+		if not items: # retorna array de cero o none
+			logging.getLogger().debug("Finished dumping %s",tableName)
+			break
+		logging.getLogger().debug("Got %s records in %s seconds",len(items),time.time()-start_time)
+			
+		start_time = time.time()
+		logging.getLogger().debug("Spitting %s records",len(items))
+		for item in items:
+			def quote(s):
+				thestring = unicode(s,"iso-8859-1")
+				thestring = thestring.encode("utf-8")
+				return "'" + thestring.replace("\\","\\\\").replace("'","\\'") + "'"
+			
+			def tostring(s): return str(s)
+			def nulificar(s): return "NULL"
+			
+			procesadores = { str : quote ,
+					 int : tostring,
+					 float : tostring,
+					 types.NoneType : nulificar
+					}
+			
+			
+			
+			newitem = []
+			for a in item:
+				try: procesador = procesadores[type(a)]
+				except KeyError:
+					raise KeyError, "%s of type %s not contemplated"%(a,type(a))
+				newitem.append(procesador(a))
+# 				if a is None:
+# 					newitem.append("NULL")
+# 				elif type(a) is str:
+# 					thestring = unicode(a,"iso-8859-1")
+# 					thestring = thestring.encode("utf-8")
+# 					newitem.append(quote(thestring))
+# 				elif type(a) in (int,float):
+# 					newitem.append(str(a))
+# 				else:
+# 					raise ValueError,"Cero senior, unexpected %r %s"(a,type(a))
+			item = newitem
+			
+			valuepart = ",".join(newitem)
+			sql = "INSERT INTO `"+tableName+"` VALUES (" + valuepart + ");\n"
+			sys.stdout.write(sql)
+# 			print sql
+		logging.getLogger().debug("Spit %s records in %s seconds",len(items),time.time()-start_time)
+
+
+# Script Start
+if __name__ == "__main__":
+	logging.basicConfig()
+	logging.getLogger().setLevel(logging.DEBUG)
+	
+	try:
+		main(sys.argv[1:])
+	except KeyboardInterrupt:
+		logging.getLogger().error("Cancelled by user")
